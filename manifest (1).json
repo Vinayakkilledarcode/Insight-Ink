@@ -1,0 +1,26 @@
+{
+  "short_name": "Streamlit",
+  "name": "Streamlit",
+  "icons": [
+    {
+      "src": "favicon_512.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "start_url": "https://insight-ink-pd2vmmgyxw3e2yqznjvdc.streamlit.app/",
+  "display": "standalone",
+  "theme_color": "#ffffff",
+  "background_color": "#ffffff",
+  "dir": "ltr",
+  "scope": "https://insight-ink-pd2vmmgyxw3e2yqznjvdc.streamlit.app/",
+  "lang": "en",
+  "orientation": "portrait",
+  "display_override": [
+    "standalone",
+    "window-controls-overlay"
+  ],
+  "categories": [
+    "news"
+  ]
+}
