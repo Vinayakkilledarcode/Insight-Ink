@@ -1,4 +1,3 @@
-# app.py  — full Streamlit app with gTTS voice playback on click (female/newscaster style)
 import streamlit as st
 import streamlit.components.v1 as components
 import requests
@@ -13,36 +12,49 @@ import re
 from collections import Counter
 from datetime import datetime
 import time
-import base64
 import io
+import os
 import importlib.util
 import subprocess
 import sys
 
-# Try auto-install packages if missing (deep_translator, gtts)
+# --- Auto-install helper for missing packages (best-effort) ---
 def try_install(package_name, import_name=None):
-    if importlib.util.find_spec(import_name or package_name) is None:
+    """Try to import a package; if missing attempt pip install (best-effort)."""
+    target = import_name or package_name
+    if importlib.util.find_spec(target) is None:
         try:
             subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
         except Exception as e:
             try:
-                st.warning(f"Auto-install failed for {package_name}: {e}")
+                st.warning(f"Could not auto-install {package_name}: {e}")
             except:
                 pass
 
+# Try to ensure deep_translator and gtts are available (best-effort)
 try_install("deep-translator", "deep_translator")
 try_install("gTTS", "gtts")
 
-# Now import translator and gTTS if available
+# Import deep_translator if available
 try:
     from deep_translator import GoogleTranslator
-except Exception:
+except Exception as e:
     GoogleTranslator = None
+    try:
+        st.warning(f"deep_translator import failed: {e}")
+    except:
+        pass
 
+# Import gTTS for server-side audio generation
 try:
     from gtts import gTTS
-except Exception:
+except Exception as e:
     gTTS = None
+    try:
+        st.warning(f"gTTS import failed: {e}")
+    except:
+        pass
+# ----------------------------------------------------------------
 
 # PWA Support
 def add_pwa_support():
@@ -59,27 +71,28 @@ def add_pwa_support():
         ]
     }
     import json
+    # ensure manifest json won't break injected script
     m = json.dumps(manifest).replace('"', '\\"')
     html = f"""
     <meta name="theme-color" content="#6366f1">
     <meta name="mobile-web-app-capable" content="yes">
     <script>
     try {{
-      const manifestData = "{m}";
-      const b = new Blob([manifestData], {{type:"application/json"}});
-      const u = URL.createObjectURL(b);
-      const l = document.createElement("link");
-      l.rel = "manifest";
-      l.href = u;
-      document.head.appendChild(l);
-      if("serviceWorker" in navigator){{
-          const sw=`self.addEventListener("install",e=>self.skipWaiting());self.addEventListener("activate",e=>self.clients.claim());`;
-          const sb=new Blob([sw],{{type:"application/javascript"}});
-          const su=URL.createObjectURL(sb);
-          navigator.serviceWorker.register(su).catch(()=>{{}});
-      }}
+        const manifestData = "{m}";
+        const b = new Blob([manifestData], {{type:"application/json"}});
+        const u = URL.createObjectURL(b);
+        const l = document.createElement("link");
+        l.rel = "manifest";
+        l.href = u;
+        document.head.appendChild(l);
+        if("serviceWorker" in navigator){{
+            const sw=`self.addEventListener("install",e=>self.skipWaiting());self.addEventListener("activate",e=>self.clients.claim());`;
+            const sb=new Blob([sw],{{type:"application/javascript"}});
+            const su=URL.createObjectURL(sb);
+            navigator.serviceWorker.register(su).catch(()=>{{}});
+        }}
     }} catch(e) {{
-      console.warn('PWA manifest injection error', e);
+        console.warn('PWA manifest injection error', e);
     }}
     </script>
     """
@@ -92,9 +105,16 @@ def add_auto_refresh(interval=30):
 # NLTK Setup
 for c in ['stopwords', 'punkt', 'punkt_tab']:
     try:
-        nltk.data.find(f'corpora/{c}' if c=='stopwords' else f'tokenizers/{c}')
+        # corpora vs tokenizers path detection
+        if c == 'stopwords':
+            nltk.data.find(f'corpora/{c}')
+        else:
+            nltk.data.find(f'tokenizers/{c}')
     except:
-        nltk.download(c, quiet=True)
+        try:
+            nltk.download(c, quiet=True)
+        except:
+            pass
 
 # Languages
 LANGUAGES = {
@@ -104,7 +124,7 @@ LANGUAGES = {
     "🇮🇳 ಕನ್ನಡ": ("kn", "kn-IN")
 }
 
-# Translation dictionaries
+# Translation dictionaries for UI
 TRANSLATIONS = {
     "hi": {
         "Quick Summary": "त्वरित सारांश",
@@ -138,45 +158,43 @@ TRANSLATIONS = {
     }
 }
 
+def translate_ui(text, lang_code):
+    if lang_code == "en":
+        return text
+    return TRANSLATIONS.get(lang_code, {}).get(text, text)
+
+# Translation of summary text using deep_translator (chunking)
 @st.cache_data(ttl=3600)
 def translate_text(text, target_lang):
-    """Translate text using deep-translator (cached)"""
     if GoogleTranslator is None:
         return text
     if not text or target_lang == "en":
         return text
     try:
-        max_length = 4500
-        if len(text) <= max_length:
-            translated = GoogleTranslator(source='auto', target=target_lang).translate(text)
-            return translated
-        else:
-            sentences = sent_tokenize(text)
-            translated_sentences = []
-            current_chunk = ""
-            for sentence in sentences:
-                if len(current_chunk) + len(sentence) < max_length:
-                    current_chunk += sentence + " "
-                else:
-                    if current_chunk:
-                        trans = GoogleTranslator(source='auto', target=target_lang).translate(current_chunk)
-                        translated_sentences.append(trans)
-                    current_chunk = sentence + " "
-            if current_chunk:
-                trans = GoogleTranslator(source='auto', target=target_lang).translate(current_chunk)
-                translated_sentences.append(trans)
-            return " ".join(translated_sentences)
+        max_len = 4500
+        if len(text) <= max_len:
+            return GoogleTranslator(source='auto', target=target_lang).translate(text)
+        # chunk by sentences
+        sents = sent_tokenize(text)
+        out = []
+        cur = ""
+        for s in sents:
+            if len(cur) + len(s) + 1 < max_len:
+                cur += s + " "
+            else:
+                out.append(GoogleTranslator(source='auto', target=target_lang).translate(cur.strip()))
+                cur = s + " "
+        if cur.strip():
+            out.append(GoogleTranslator(source='auto', target=target_lang).translate(cur.strip()))
+        return " ".join(out)
     except Exception as e:
-        st.warning(f"Translation error: {e}")
+        try:
+            st.warning(f"Translation error: {e}")
+        except:
+            pass
         return text
 
-def translate_ui(text, lang_code):
-    """Translate UI elements"""
-    if lang_code == "en":
-        return text
-    return TRANSLATIONS.get(lang_code, {}).get(text, text)
-
-# Categories (same as your original)
+# Categories (same as original)
 CATEGORIES = {
     "🔴 Breaking": [
         ("BBC", "https://www.bbc.com/news"),
@@ -228,27 +246,59 @@ CATEGORIES = {
     ]
 }
 
-def clean_title(title, content):
-    """Clean noisy news site titles but don't overwrite real titles"""
-    t = (title or "").strip()
-    for s in ['BBC', 'Reuters', 'CNN', 'Hindu', 'NDTV', 'ESPN', 'Variety', 'TechCrunch', 'Bloomberg', 'Guardian']:
-        t = t.replace(f' - {s}', '').replace(f'| {s}', '').replace(f': {s}', '')
-    # remove duplicates like 'NewsNews' and filler words
-    t = t.replace('NewsNews', '').replace('Latest', '').replace('Breaking', '')
-    t = ' '.join(t.split())
-    if not t or len(t) < 10:
-        sents = sent_tokenize(content or "")
-        if sents:
-            t = sents[0].split(',')[0] if ',' in sents[0] else sents[0]
-    if len(t) > 120:
-        t = t.split(' - ')[0] if ' - ' in t else ' '.join(t.split()[:18]) + '...'
-    if t.isupper():
-        t = t.title()
-    return t.strip(' .-:') or "Article"
+# Title cleaning and robust extraction
+def extract_title_from_soup(soup):
+    """
+    Try multiple metadata locations to extract a reliable title:
+      1) og:title
+      2) meta name="title"
+      3) <title> tag (page title)
+      4) h1
+    Return the raw title string (minimal cleaning).
+    """
+    # 1) og:title
+    og = soup.find('meta', property='og:title')
+    if og and og.get('content'):
+        return og['content'].strip()
+    # 2) meta name=title
+    meta_title = soup.find('meta', attrs={'name':'title'})
+    if meta_title and meta_title.get('content'):
+        return meta_title['content'].strip()
+    # 3) <title>
+    ttag = soup.find('title')
+    if ttag and ttag.get_text(strip=True):
+        return ttag.get_text(strip=True)
+    # 4) h1
+    h1 = soup.find('h1')
+    if h1 and h1.get_text(strip=True):
+        return h1.get_text(strip=True)
+    return "Article"
 
+def clean_title_for_display(raw_title):
+    """
+    Light touch cleaning for display: remove repeated site suffixes such as ' - BBC' etc
+    while preserving the main title text as much as possible.
+    Avoid over-normalization so user's requested 'title exactly as fetched' is respected.
+    """
+    t = raw_title.strip()
+    # Remove obvious duplicates like 'NewsNews' or repeated word
+    t = re.sub(r'NewsNews', 'News', t, flags=re.IGNORECASE)
+    # Remove trailing site names in common formats
+    site_tokens = [' - BBC', ' - Reuters', ' - CNN', ' - The Hindu', ' - NDTV', ' - ESPN', ' - Variety', ' - TechCrunch', ' - Bloomberg', ' - Guardian', ' | BBC', ' | Reuters']
+    for s in site_tokens:
+        if s in t:
+            t = t.replace(s, '')
+    # Remove trailing separators repeated
+    t = re.sub(r'(\s*[-|:]\s*)+$', '', t).strip()
+    # If title is empty after cleaning, fallback to original raw_title
+    if not t:
+        return raw_title.strip()
+    return t
+
+# Keyword extraction
 def get_keywords(text, n=5):
     try:
-        t = (text or "").lower()
+        t = text.lower()
         words = word_tokenize(t)
         stops = set(stopwords.words('english'))
         stops.update(['said', 'new', 'year', 'people', 'time', 'day', 'also', 'would', 'could', 'report', 'news'])
@@ -273,6 +323,7 @@ def get_keywords(text, n=5):
     except:
         return []
 
+# Article fetching logic (improved title extraction)
 def fetch_article(url):
     h = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     try:
@@ -280,22 +331,26 @@ def fetch_article(url):
         r.raise_for_status()
         r.encoding = r.apparent_encoding
         soup = BeautifulSoup(r.text, 'html.parser')
+        # remove boilerplate tags
         for t in soup(["script", "style", "nav", "footer", "header", "aside"]):
             t.decompose()
-        title_tag = soup.find('h1')
-        title = title_tag.get_text(strip=True) if title_tag else None
+
+        title = extract_title_from_soup(soup)  # robust extraction
+
         text = ""
-        arts = soup.find_all(['article', 'div', 'main'],
-                             class_=lambda x: x and any(k in str(x).lower() for k in ['article', 'story', 'content', 'post', 'body']))
+        # try to find main article containers with keywords in class
+        arts = soup.find_all(['article', 'div', 'main'], class_=lambda x: x and any(k in str(x).lower() for k in ['article', 'story', 'content', 'post', 'body']))
         if arts:
             for a in arts[:3]:
                 ps = a.find_all('p')
                 for p in ps:
                     pt = p.get_text(strip=True)
+                    # avoid tiny caption-like paragraphs
                     if len(pt) > 30:
                         text += pt + ' '
                 if len(text) > 300:
                     break
+        # fallback to all paragraphs
         if len(text) < 200:
             ps = soup.find_all('p')
             for p in ps:
@@ -305,12 +360,11 @@ def fetch_article(url):
                 if len(text) > 500:
                     break
         text = ' '.join(text.split())
-        # If we couldn't find a title, try to craft from content (fallback)
-        if (not title or title.strip() == '') and text:
-            title = clean_title("", text)
         if text and len(text) > 150:
-            return {'title': title or "Article", 'url': url, 'content': text, 'time': datetime.now()}
-    except Exception:
+            return {'title': title, 'url': url, 'content': text, 'time': datetime.now()}
+    except Exception as e:
+        # swallow network errors quietly
+        # optional: log or collect errors
         pass
     return None
 
@@ -335,23 +389,24 @@ def fetch_category(url, max_articles=30, offset=0):
                     links.append(base + href)
             if len(links) >= (max_articles + offset) * 4:
                 break
+
         links = list(dict.fromkeys(links))
         links = links[offset:offset + max_articles * 3]
+
         fetched = 0
         for link in links:
             if fetched >= max_articles:
                 break
             a = fetch_article(link)
             if a:
-                # ensure title is cleaned but keep fetched title intact
-                fetched += 1
                 articles.append(a)
-    except Exception:
+                fetched += 1
+    except:
         pass
     return articles
 
+# Summarization function (same algorithm improved)
 def summarize(text, n=6):
-    """Enhanced summarization with better sentence selection"""
     sents = sent_tokenize(text)
     if len(sents) <= n:
         return ' '.join(sents)
@@ -360,12 +415,16 @@ def summarize(text, n=6):
         sv = vec.fit_transform(sents)
         dv = vec.transform([' '.join(sents)])
         scores = cosine_similarity(sv, dv).flatten()
+
         if len(scores) > 0:
             scores[0] *= 1.3
+
         top = scores.argsort()[-n:][::-1]
         summary_sents = [sents[i] for i in sorted(top.tolist())]
+
         if 0 not in top and len(sents[0].split()) < 30:
             summary_sents = [sents[0]] + summary_sents[1:]
+
         return ' '.join(summary_sents)
     except:
         return ' '.join(sents[:n])
@@ -382,48 +441,11 @@ def time_ago(dt):
     else:
         return f"{int(s/86400)}d"
 
-# Audio generation using gTTS -> returns base64 mp3 string
-def generate_tts_base64(text, lang_code):
-    """
-    Generate mp3 bytes using gTTS and return base64 string.
-    lang_code: short code like 'en','hi','mr','kn' — will fallback gracefully.
-    """
-    if gTTS is None:
-        return None
-    try:
-        # gTTS may not support all language codes exactly; use mapping/fallbacks if needed
-        gtts_lang = lang_code
-        # For Kannada, gTTS uses 'kn' sometimes unsupported — fallback to English
-        if lang_code == 'kn':
-            # gTTS may not have Kannada voice on some installs; fallback to 'en' for reliability
-            try:
-                # try creating with kn; if fails, will go to except
-                buf_test = io.BytesIO()
-                gTTS(" ", lang=lang_code).write_to_fp(buf_test)
-            except Exception:
-                gtts_lang = 'en'
-        # Create a BytesIO buffer and write mp3 into it
-        buf = io.BytesIO()
-        # Use a pacing technique: ensure punctuation and short breaks for anchor-style reading
-        # The caller should add punctuation appropriately.
-        tts = gTTS(text.strip(), lang=gtts_lang, slow=False)
-        tts.write_to_fp(buf)
-        buf.seek(0)
-        b64 = base64.b64encode(buf.read()).decode('utf-8')
-        return b64
-    except Exception as e:
-        # if audio generation fails, return None and warn
-        try:
-            st.warning(f"Audio generation failed: {e}")
-        except:
-            pass
-        return None
-
-# Streamlit App
+# ---------------- Streamlit App UI & Logic ----------------
 st.set_page_config(layout="wide", page_title="Insight Ink Pro", page_icon="🚀", initial_sidebar_state="expanded")
 add_pwa_support()
 
-# CSS (kept as your original)
+# Advanced CSS
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
@@ -489,6 +511,8 @@ if 'prev_language' not in st.session_state:
     st.session_state.prev_language = "en"
 if 'translated_articles' not in st.session_state:
     st.session_state.translated_articles = {}
+if 'audio_cache' not in st.session_state:
+    st.session_state.audio_cache = {}  # key -> bytes
 
 # Header
 col1, col2, col3 = st.columns([4, 1, 1])
@@ -504,10 +528,13 @@ with col3:
     lang_index = lang_keys.index(current_lang[0]) if current_lang else 0
     selected_lang = st.selectbox("", lang_keys, index=lang_index, label_visibility="collapsed", key="lang_select")
     new_lang = LANGUAGES[selected_lang][0]
+
+    # Detect language change and rerun
     if new_lang != st.session_state.prev_language:
         st.session_state.language = new_lang
         st.session_state.prev_language = new_lang
-        st.session_state.translated_articles = {}
+        st.session_state.translated_articles = {}  # Clear translation cache
+        st.session_state.audio_cache = {}  # Clear audio cache (language changed)
         st.rerun()
 
 st.markdown("---")
@@ -515,21 +542,28 @@ st.markdown("---")
 # Sidebar
 with st.sidebar:
     st.markdown("### ⚙️ Control Center")
+
     if st.session_state.category and st.session_state.source:
         st.success(f"📡 {st.session_state.source[0]}")
+
         st.markdown("#### 🔄 Auto-Refresh")
         auto_refresh = st.toggle("Enable", value=st.session_state.auto_refresh)
         st.session_state.auto_refresh = auto_refresh
+
         if auto_refresh:
             interval = st.slider("Interval (sec)", 20, 120, 40)
             add_auto_refresh(interval)
             st.info(f"⏱️ {interval}s")
+
         st.markdown("---")
+
         if st.button("🔄 Refresh", use_container_width=True):
             st.session_state.offset = 0
             st.session_state.articles = []
             st.session_state.translated_articles = {}
+            st.session_state.audio_cache = {}
             st.rerun()
+
         if st.button(f"📥 {translate_ui('Load 10 More', st.session_state.language)}", use_container_width=True):
             with st.spinner(translate_ui("Loading", st.session_state.language)):
                 st.session_state.offset += 10
@@ -538,14 +572,18 @@ with st.sidebar:
                     if a['url'] not in [x['url'] for x in st.session_state.articles]:
                         st.session_state.articles.append(a)
             st.rerun()
+
         st.markdown("---")
+
         if st.button("🏠 Home", use_container_width=True):
             st.session_state.category = None
             st.session_state.source = None
             st.session_state.articles = []
             st.session_state.offset = 0
             st.session_state.translated_articles = {}
+            st.session_state.audio_cache = {}
             st.rerun()
+
     st.markdown("---")
     st.markdown("### 📊 Statistics")
     st.markdown(f'<div class="stat-card"><div class="stat-number">{len(st.session_state.articles)}</div><div class="stat-label">{translate_ui("articles loaded", st.session_state.language)}</div></div>', unsafe_allow_html=True)
@@ -564,6 +602,7 @@ if not st.session_state.category:
                 st.session_state.articles = []
                 st.session_state.offset = 0
                 st.session_state.translated_articles = {}
+                st.session_state.audio_cache = {}
                 st.rerun()
 
 elif not st.session_state.source:
@@ -577,59 +616,61 @@ elif not st.session_state.source:
                 st.session_state.source = (name, url)
                 with st.spinner(f"{translate_ui('Loading', st.session_state.language)} {name}..."):
                     st.session_state.articles = fetch_category(url, 15, 0)
+                    st.session_state.translated_articles = {}
+                    st.session_state.audio_cache = {}
                 st.rerun()
 
 else:
     if st.session_state.articles:
         st.success(f"✅ {len(st.session_state.articles)} {translate_ui('articles loaded', st.session_state.language)}")
+
         for i, art in enumerate(st.session_state.articles):
-            # Use fetched title (do not override) but clean it for fallback if necessary
-            fetched_title = art.get('title', '') or clean_title('', art.get('content', ''))
-            # Summarize content only
-            summary_en = summarize(art.get('content', ''), 6)
-            # Translate title and summary if needed
-            lang_code = st.session_state.language
-            title_trans = fetched_title
-            summary_trans = summary_en
-            cache_key_title = f"{art['url']}_{lang_code}_title"
-            cache_key_summary = f"{art['url']}_{lang_code}_summary"
-            if lang_code != "en":
-                # translate title
-                if cache_key_title not in st.session_state.translated_articles:
-                    with st.spinner(f"🌐 Translating title {i+1}..."):
-                        t_title = translate_text(fetched_title, lang_code)
-                        st.session_state.translated_articles[cache_key_title] = {'title': t_title}
-                title_trans = st.session_state.translated_articles[cache_key_title]['title']
-                # translate summary
-                if cache_key_summary not in st.session_state.translated_articles:
-                    with st.spinner(f"🌐 Translating article {i+1} summary..."):
-                        t_sum = translate_text(summary_en, lang_code)
-                        st.session_state.translated_articles[cache_key_summary] = {'summary': t_sum}
-                summary_trans = st.session_state.translated_articles[cache_key_summary]['summary']
-            # Keywords
-            keywords = get_keywords(art.get('content', ''), 5)
-            # Display
+            # Keep raw fetched title intact for display and speech (as requested)
+            fetched_title = art.get('title', 'Article')  # from fetch_article (already uses og/title/h1)
+            display_title = clean_title_for_display(fetched_title)
+
+            # Summarize only the content, not the title
+            summary_en = summarize(art['content'], 6)
+
+            # Translation cache keyed by article url + target language
+            cache_key = f"{art['url']}_{st.session_state.language}_summary"
+
+            if st.session_state.language != "en":
+                if cache_key not in st.session_state.translated_articles:
+                    with st.spinner(f"🌐 Translating article {i+1}..."):
+                        trans = translate_text(summary_en, st.session_state.language)
+                        st.session_state.translated_articles[cache_key] = {'summary': trans}
+                        summary_trans = trans
+                else:
+                    summary_trans = st.session_state.translated_articles[cache_key]['summary']
+            else:
+                summary_trans = summary_en
+
+            keywords = get_keywords(art['content'], 5)
+
+            # Layout: Title and time
             col1, col2 = st.columns([5, 1])
             with col1:
-                # show original fetched title but show translated title below in smaller text (if language != en)
-                st.markdown(f"### 📌 {fetched_title}")
-                if lang_code != "en" and title_trans and title_trans != fetched_title:
-                    st.markdown(f"**Translated:** {title_trans}")
+                # Show the original fetched title (unchanged)
+                st.markdown(f"### 📌 {display_title}")
             with col2:
                 if i < 5:
                     st.markdown('<span class="new-badge">NEW</span>', unsafe_allow_html=True)
                 st.markdown(f'<span class="time-badge">{time_ago(art["time"])}</span>', unsafe_allow_html=True)
+
+            # Keywords
             if keywords:
                 kw_html = ''.join([f'<span class="keyword-tag">{k}</span>' for k in keywords])
                 st.markdown(kw_html, unsafe_allow_html=True)
-            st.markdown(f"**✨ {translate_ui('Quick Summary', st.session_state.language)}:**")
+
             # Highlighted summary
+            st.markdown(f"**✨ {translate_ui('Quick Summary', st.session_state.language)}:**")
             st.markdown(
                 f"""
                 <div style="
                     background: linear-gradient(135deg, #1f2937 0%, #111827 100%);
                     border-left: 4px solid #6366f1;
-                    padding: 12px;
+                    padding: 14px;
                     border-radius: 8px;
                     color: #f8fafc;
                     line-height:1.6;
@@ -642,114 +683,94 @@ else:
                 """,
                 unsafe_allow_html=True
             )
-            # Prepare anchor-style text for TTS: Title + short pause + summary
-            # Add punctuation / pauses to sound like an anchor
-            # E.g. "Title. — Now, the summary in concise form."
-            combined_for_tts = f"{title_trans}. — {summary_trans}"
-            # Generate audio base64 once (cached by session_state ideally)
-            audio_cache_key = f"{art['url']}_{lang_code}_audio_b64"
-            audio_b64 = st.session_state.translated_articles.get(audio_cache_key, {}).get('b64') if audio_cache_key in st.session_state.translated_articles else None
-            if audio_b64 is None:
-                audio_b64 = generate_tts_base64(combined_for_tts, lang_code)
-                # store in translations cache dict under audio cache key
-                if audio_b64:
-                    st.session_state.translated_articles[audio_cache_key] = {'b64': audio_b64}
-            # Render Listen button + hidden audio player that only plays on click
-            btn_id = f"playbtn_{i}"
-            audio_id = f"audio_{i}"
-            if audio_b64:
-                # embed a tiny JS widget: hidden audio element and a visible button. On click toggle play/pause.
-                audio_html = f"""
-                <div style="margin-top:8px;">
-                  <button id="{btn_id}" class="voice-btn">🎙️ {translate_ui('Listen', st.session_state.language)}</button>
-                </div>
-                <audio id="{audio_id}" preload="auto" style="display:none;">
-                  <source src="data:audio/mp3;base64,{audio_b64}" type="audio/mp3">
-                </audio>
-                <script>
-                (function() {{
-                  const btn = document.getElementById('{btn_id}');
-                  const audio = document.getElementById('{audio_id}');
-                  let isPlaying = false;
-                  // toggle behavior but ensure user click triggers actual playback
-                  btn.addEventListener('click', function() {{
-                    if (!audio) {{
-                      alert('Audio not available');
-                      return;
-                    }}
-                    if (audio.paused) {{
-                      audio.currentTime = 0;
-                      audio.play().catch(e => {{
-                        console.warn('play failed', e);
-                        alert('Playback failed: user gesture required or browser blocked it.');
-                      }});
-                      btn.innerText = '⏸️ Stop';
-                      btn.style.background = 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)';
-                    }} else {{
-                      audio.pause();
-                      audio.currentTime = 0;
-                      btn.innerText = '🎙️ {translate_ui('Listen', st.session_state.language)}';
-                      btn.style.background = 'linear-gradient(135deg, #f59e0b 0%, #d97706 100%)';
-                    }}
-                  }});
-                  audio.onended = function() {{
-                    btn.innerText = '🎙️ {translate_ui('Listen', st.session_state.language)}';
-                    btn.style.background = 'linear-gradient(135deg, #f59e0b 0%, #d97706 100%)';
-                  }};
-                }})();
-                </script>
-                """
-                components.html(audio_html, height=100)
-            else:
-                # audio generation failed fallback: provide a JS TTS using speechSynthesis as backup
-                # (speechSynthesis can be lower quality and may not have female voice for given lang)
-                js_text = combined_for_tts.replace("`", "\\`").replace("\n", " ")
-                fallback_html = f"""
-                <div style="margin-top:8px;">
-                  <button id="{btn_id}" class="voice-btn">🎙️ {translate_ui('Listen', st.session_state.language)}</button>
-                </div>
-                <script>
-                (function() {{
-                  const btn = document.getElementById('{btn_id}');
-                  let utter = null;
-                  btn.addEventListener('click', function() {{
-                    if (!('speechSynthesis' in window)) {{
-                      alert('Speech synthesis not supported in your browser.');
-                      return;
-                    }}
-                    if (utter && speechSynthesis.speaking) {{
-                      speechSynthesis.cancel();
-                      btn.innerText = '🎙️ {translate_ui('Listen', st.session_state.language)}';
-                      btn.style.background = 'linear-gradient(135deg, #f59e0b 0%, #d97706 100%)';
-                      return;
-                    }}
-                    const text = `{js_text}`;
-                    utter = new SpeechSynthesisUtterance(text);
-                    utter.lang = '{lang_code}';
-                    utter.rate = 0.95;
-                    utter.pitch = 1.0;
-                    const voices = speechSynthesis.getVoices();
-                    // attempt to pick a female voice name
-                    const female = voices.find(v => /female|zira|samantha|victoria|alloy|google|woman/i.test(v.name) && v.lang && v.lang.startsWith('{lang_code}'.split('-')[0]));
-                    if (female) utter.voice = female;
-                    speechSynthesis.cancel();
-                    speechSynthesis.speak(utter);
-                    btn.innerText = '⏸️ Stop';
-                    btn.style.background = 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)';
-                    utter.onend = function() {{
-                      btn.innerText = '🎙️ {translate_ui('Listen', st.session_state.language)}';
-                      btn.style.background = 'linear-gradient(135deg, #f59e0b 0%, #d97706 100%)';
-                    }};
-                    utter.onerror = function() {{
-                      btn.innerText = '🎙️ {translate_ui('Listen', st.session_state.language)}';
-                      btn.style.background = 'linear-gradient(135deg, #f59e0b 0%, #d97706 100%)';
-                    }};
-                  }});
-                }})();
-                </script>
-                """
-                components.html(fallback_html, height=100)
+
+            # Voice: generate and play on-click using gTTS (female voice default)
+            # We'll generate audio bytes and cache them in session_state.audio_cache
+            # Use the fetched_title (unchanged) + summary_trans for the narration
+            # But the user asked: "it should summarize the idea of news but not title" — so we will speak the
+            # title (as fetched) followed by the summary (translated if requested).
+            # Prepare strings and safe language codes for gTTS
+            lang_code = st.session_state.language  # 'en', 'hi', 'mr', 'kn'
+            # Map to gTTS supported languages if necessary; gTTS supports 'en', 'hi', 'mr' (Marathi support may be limited),
+            # 'kn' might not be supported by gTTS; if unsupported, fallback to 'en' or use original language code.
+            gtts_supported = {'en', 'hi', 'mr', 'es', 'fr', 'de', 'it', 'pt', 'nl', 'ru', 'ja', 'zh-cn'}
+            gtts_lang = lang_code if lang_code in gtts_supported else lang_code.split('-')[0] if lang_code.split('-')[0] in gtts_supported else 'en'
+
+            # Prepare text to speak (title + summary). Title kept as fetched from source.
+            to_speak = f"{fetched_title}. {summary_trans}"
+
+            # Ensure to_speak is a string and not unexpectedly numeric
+            if not isinstance(to_speak, str):
+                to_speak = str(to_speak)
+
+            # Cache key for audio bytes
+            audio_key = f"{art['url']}_{st.session_state.language}_audio"
+
+            # Button to trigger generation/playing
+            # Use a unique key so Streamlit knows which article button was clicked
+            play_btn_key = f"play_{i}_{hash(audio_key) & 0xffffffff}"
+
+            # When user clicks the button, we generate audio (if not cached) and then show st.audio for playback
+            if st.button(f"🔊 {translate_ui('Listen', st.session_state.language)}", key=play_btn_key):
+                # Generate or fetch from cache
+                audio_bytes = None
+                if audio_key in st.session_state.audio_cache:
+                    audio_bytes = st.session_state.audio_cache[audio_key]
+                else:
+                    # Generate via gTTS if available
+                    if gTTS is not None:
+                        try:
+                            # chunk the text if very large to avoid service issues
+                            # gTTS handles long strings but we be cautious: split into ~4000-character chunks
+                            max_chunk = 4000
+                            chunks = []
+                            if len(to_speak) <= max_chunk:
+                                chunks = [to_speak]
+                            else:
+                                sents = sent_tokenize(to_speak)
+                                cur = ""
+                                for s in sents:
+                                    if len(cur) + len(s) + 1 < max_chunk:
+                                        cur += s + " "
+                                    else:
+                                        chunks.append(cur.strip())
+                                        cur = s + " "
+                                if cur.strip():
+                                    chunks.append(cur.strip())
+                            # combine bytes
+                            combined = io.BytesIO()
+                            for idx, chunk in enumerate(chunks):
+                                t = gTTS(text=chunk, lang=gtts_lang, slow=False)
+                                temp_buf = io.BytesIO()
+                                t.write_to_fp(temp_buf)
+                                temp_buf.seek(0)
+                                combined.write(temp_buf.read())
+                            audio_bytes = combined.getvalue()
+                            # cache in session
+                            st.session_state.audio_cache[audio_key] = audio_bytes
+                        except Exception as e:
+                            try:
+                                st.warning(f"Audio generation failed: {e}")
+                            except:
+                                pass
+                            audio_bytes = None
+                    else:
+                        try:
+                            st.warning("gTTS not available. Install gTTS package to enable audio playback.")
+                        except:
+                            pass
+                        audio_bytes = None
+
+                # If we have audio bytes, play them
+                if audio_bytes:
+                    # play using st.audio (Streamlit will serve bytes without saving file)
+                    st.audio(audio_bytes, format='audio/mp3')
+                else:
+                    st.info("Audio not available for this article.")
+
+            # Show read full link
             st.markdown(f"[{translate_ui('Read Full', st.session_state.language)} →]({art['url']})")
             st.markdown("---")
+
     else:
         st.warning(f"⚠️ No articles found. Try refreshing or selecting a different source.")
